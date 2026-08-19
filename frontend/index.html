@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Geo Dispatch Demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  html, body { margin: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  #map { position: absolute; inset: 0; }
+  #panel {
+    position: absolute; top: 12px; left: 12px; z-index: 1000;
+    background: rgba(255,255,255,0.96); border-radius: 10px; padding: 14px 16px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.2); width: 280px; font-size: 13px; color: #222;
+  }
+  #panel h1 { font-size: 15px; margin: 0 0 8px; }
+  #panel p { margin: 4px 0; line-height: 1.4; }
+  #panel button {
+    margin-top: 8px; width: 100%; padding: 8px; border: none; border-radius: 6px;
+    background: #111; color: #fff; font-size: 13px; cursor: pointer;
+  }
+  #panel button:disabled { background: #999; cursor: not-allowed; }
+  #panel .hint { color: #666; font-size: 12px; }
+  #legend span { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
+  .status-line { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h1>Geo Dispatch Demo</h1>
+  <p class="hint">Click the map to set <b>pickup</b>, click again for <b>dropoff</b>, then request a ride.</p>
+  <p id="pickup-line">Pickup: <i>not set</i></p>
+  <p id="dropoff-line">Dropoff: <i>not set</i></p>
+  <button id="request-btn" disabled>Request Ride</button>
+  <button id="reset-btn">Reset Selection</button>
+  <p id="trip-status"></p>
+  <div id="legend">
+    <p class="status-line"><span style="background:#2ecc71"></span> available</p>
+    <p class="status-line"><span style="background:#f39c12"></span> en route to pickup</p>
+    <p class="status-line"><span style="background:#3498db"></span> on trip</p>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const STATUS_COLOR = {
+  available: "#2ecc71",
+  en_route_to_pickup: "#f39c12",
+  on_trip: "#3498db",
+};
+
+let map, driverMarkers = {}, pickup = null, dropoff = null;
+let pickupMarker = null, dropoffMarker = null, routeLine = null;
+let activeTripId = null;
+
+function initMap(bounds) {
+  const center = [(bounds.min_lat + bounds.max_lat) / 2, (bounds.min_lon + bounds.max_lon) / 2];
+  map = L.map("map").setView(center, 14);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "&copy; OpenStreetMap contributors",
+    maxZoom: 19,
+  }).addTo(map);
+  map.on("click", onMapClick);
+}
+
+function onMapClick(e) {
+  if (!pickup) {
+    pickup = e.latlng;
+    if (pickupMarker) map.removeLayer(pickupMarker);
+    pickupMarker = L.marker(pickup, { title: "Pickup" }).addTo(map).bindPopup("Pickup").openPopup();
+    document.getElementById("pickup-line").innerHTML = `Pickup: ${pickup.lat.toFixed(4)}, ${pickup.lng.toFixed(4)}`;
+  } else if (!dropoff) {
+    dropoff = e.latlng;
+    if (dropoffMarker) map.removeLayer(dropoffMarker);
+    dropoffMarker = L.marker(dropoff, { title: "Dropoff" }).addTo(map).bindPopup("Dropoff").openPopup();
+    document.getElementById("dropoff-line").innerHTML = `Dropoff: ${dropoff.lat.toFixed(4)}, ${dropoff.lng.toFixed(4)}`;
+    document.getElementById("request-btn").disabled = false;
+  }
+}
+
+document.getElementById("reset-btn").onclick = () => {
+  pickup = dropoff = null;
+  activeTripId = null;
+  if (pickupMarker) map.removeLayer(pickupMarker);
+  if (dropoffMarker) map.removeLayer(dropoffMarker);
+  if (routeLine) map.removeLayer(routeLine);
+  pickupMarker = dropoffMarker = routeLine = null;
+  document.getElementById("pickup-line").innerHTML = "Pickup: <i>not set</i>";
+  document.getElementById("dropoff-line").innerHTML = "Dropoff: <i>not set</i>";
+  document.getElementById("trip-status").innerHTML = "";
+  document.getElementById("request-btn").disabled = true;
+};
+
+document.getElementById("request-btn").onclick = async () => {
+  const btn = document.getElementById("request-btn");
+  btn.disabled = true;
+  const res = await fetch("/api/request-ride", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      rider_lat: pickup.lat, rider_lon: pickup.lng,
+      dest_lat: dropoff.lat, dest_lon: dropoff.lng,
+    }),
+  });
+  const data = await res.json();
+  if (data.status === "no_drivers_available") {
+    document.getElementById("trip-status").innerHTML = "No drivers available nearby — try again.";
+    btn.disabled = false;
+  } else {
+    activeTripId = data.trip_id;
+    document.getElementById("trip-status").innerHTML =
+      `Matched driver ${data.driver_id} &mdash; ETA ${data.eta_min} min`;
+  }
+};
+
+function renderDrivers(drivers) {
+  const seen = new Set();
+  for (const d of drivers) {
+    seen.add(d.id);
+    const color = STATUS_COLOR[d.status] || "#999";
+    if (driverMarkers[d.id]) {
+      driverMarkers[d.id].setLatLng([d.lat, d.lon]);
+      driverMarkers[d.id].setStyle({ color, fillColor: color });
+    } else {
+      driverMarkers[d.id] = L.circleMarker([d.lat, d.lon], {
+        radius: 6, color, fillColor: color, fillOpacity: 0.9, weight: 2,
+      }).addTo(map).bindTooltip(d.id, { direction: "top" });
+    }
+  }
+  for (const id of Object.keys(driverMarkers)) {
+    if (!seen.has(id)) {
+      map.removeLayer(driverMarkers[id]);
+      delete driverMarkers[id];
+    }
+  }
+}
+
+function renderActiveTrip(trips) {
+  if (!activeTripId) return;
+  const trip = trips.find((t) => t.id === activeTripId);
+  if (!trip) return;
+
+  if (trip.status === "completed") {
+    document.getElementById("trip-status").innerHTML = "Trip completed.";
+    if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
+    document.getElementById("request-btn").disabled = false;
+    return;
+  }
+
+  document.getElementById("trip-status").innerHTML =
+    `Trip ${trip.status} &mdash; ETA ${trip.eta_min ?? "?"} min`;
+
+  const driverMarker = driverMarkers[trip.driver_id];
+  if (!driverMarker) return;
+  const driverLatLng = driverMarker.getLatLng();
+  const target = trip.status === "in_progress"
+    ? [trip.dest_lat, trip.dest_lon]
+    : [trip.rider_lat, trip.rider_lon];
+  const points = [[driverLatLng.lat, driverLatLng.lng], target];
+  if (routeLine) {
+    routeLine.setLatLngs(points);
+  } else {
+    routeLine = L.polyline(points, { color: "#111", weight: 3, dashArray: "6 6" }).addTo(map);
+  }
+}
+
+async function bootstrap() {
+  const res = await fetch("/api/state");
+  const state = await res.json();
+  initMap(state.bounds);
+  renderDrivers(state.drivers);
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onmessage = (evt) => {
+    const state = JSON.parse(evt.data);
+    renderDrivers(state.drivers);
+    renderActiveTrip(state.trips);
+  };
+}
+
+bootstrap();
+</script>
+</body>
+</html>
