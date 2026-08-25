@@ -9,6 +9,7 @@ class DriverStatus(str, Enum):
 
 
 class TripStatus(str, Enum):
+    PENDING = "pending"  # batch strategy only: waiting for the next batch window
     MATCHED = "matched"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
@@ -37,3 +38,5 @@ class Trip:
     driver_id: str | None = None
     eta_min: float | None = None
     completed_at_tick: int | None = None
+    requested_at_tick: int | None = None
+    matched_at_tick: int | None = None

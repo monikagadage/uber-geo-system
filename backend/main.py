@@ -11,6 +11,7 @@ sockets).
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -19,8 +20,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .simulation import Simulation, SimulationConfig
+from .store import TripStore
 
 TICK_SECONDS = 1.0
+
+# "greedy" (default) or "batch" — see SimulationConfig / backend/matching.py.
+# Set via e.g. `MATCHING_STRATEGY=batch uvicorn backend.main:app ...`.
+MATCHING_STRATEGY = os.environ.get("MATCHING_STRATEGY", "greedy")
 
 
 class ConnectionManager:
@@ -46,7 +52,11 @@ class ConnectionManager:
             self.disconnect(ws)
 
 
-sim = Simulation(SimulationConfig(num_drivers=40, tick_seconds=TICK_SECONDS))
+store = TripStore()
+sim = Simulation(
+    SimulationConfig(num_drivers=40, tick_seconds=TICK_SECONDS, matching_strategy=MATCHING_STRATEGY),
+    store=store,
+)
 manager = ConnectionManager()
 
 
@@ -88,6 +98,14 @@ def request_ride(req: RideRequest) -> dict:
 @app.get("/api/state")
 def get_state() -> dict:
     return sim.snapshot()
+
+
+@app.get("/api/trips")
+def get_trips(limit: int = 50) -> dict:
+    """Trip history from SQLite — survives a process restart, unlike
+    `sim.trips` which only holds recently-active/completed trips in memory.
+    """
+    return {"trips": store.list_trips(limit=limit)}
 
 
 @app.websocket("/ws")

@@ -104,11 +104,14 @@ document.getElementById("request-btn").onclick = async () => {
     }),
   });
   const data = await res.json();
+  activeTripId = data.trip_id;
   if (data.status === "no_drivers_available") {
     document.getElementById("trip-status").innerHTML = "No drivers available nearby — try again.";
     btn.disabled = false;
+  } else if (data.status === "pending") {
+    // Batch matching strategy: request is queued until the next batch window resolves it.
+    document.getElementById("trip-status").innerHTML = "Ride requested — waiting for next batch match&hellip;";
   } else {
-    activeTripId = data.trip_id;
     document.getElementById("trip-status").innerHTML =
       `Matched driver ${data.driver_id} &mdash; ETA ${data.eta_min} min`;
   }
