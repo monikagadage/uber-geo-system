@@ -118,6 +118,29 @@ class QuadTree:
         self.children = [QuadTree(b, self.capacity, self.max_depth, self.depth + 1) for b in self.boundary.split()]
         self.divided = True
 
+    def remove(self, lat: float, lon: float, payload: Any) -> bool:
+        """Remove a single (lat, lon, payload) point — the inverse of insert().
+
+        A point can end up stored at any node along its insertion path (see
+        insert(): a node keeps points it already held even after it later
+        subdivides), so removal checks this node's own points first, then
+        recurses into children if the boundary contains the point and it
+        wasn't found here. Cost is O(depth), not O(n): this is what makes
+        "remove the old cell, insert the new cell" for one moved driver
+        cheap enough to do every tick instead of rebuilding the whole tree.
+        """
+        if not self.boundary.contains(lat, lon):
+            return False
+        for i, (plat, plon, ppayload) in enumerate(self.points):
+            if plat == lat and plon == lon and ppayload == payload:
+                del self.points[i]
+                return True
+        if self.divided:
+            for child in self.children:
+                if child.remove(lat, lon, payload):
+                    return True
+        return False
+
     def query_radius(
         self, lat: float, lon: float, radius_km: float, results: list[tuple[float, Any]] | None = None
     ) -> list[tuple[float, Any]]:
