@@ -55,6 +55,7 @@ class Simulation:
         self._ticks_since_batch = 0
         self._spawn_drivers()
         self._rebuild_index()
+        self.rehydration: dict = self._rehydrate_from_store()
 
     # ---- setup -----------------------------------------------------
 
@@ -86,6 +87,66 @@ class Simulation:
         for driver in self.drivers.values():
             if driver.status == DriverStatus.AVAILABLE:
                 self.index.insert(driver.lat, driver.lon, driver.id)
+
+    def _rehydrate_from_store(self) -> dict:
+        """Recover in-flight trip state from `TripStore` on startup instead
+        of always starting from a blank slate (see DESIGN.md "Fault-tolerant
+        restart" for the full writeup of this choice).
+
+        `Simulation.drivers` and `self.index` are never persisted (see
+        README: "what's deliberately left out"), so a restart always spawns
+        a brand-new fleet at random positions — there is no old driver state
+        to rehydrate them into. What *is* durable is `TripStore`, so this
+        only rehydrates trips: any trip still PENDING/MATCHED/IN_PROGRESS in
+        the store when this process starts was left that way by an unclean
+        shutdown (a clean run always drives every trip to COMPLETED or
+        NO_DRIVERS_AVAILABLE before it could go stale). For each one:
+
+        1. Mark it INTERRUPTED in the store — a new terminal status, so it
+           stops showing up as "still active" forever. Its `driver_id` (if
+           any) is meaningless now: that driver id likely doesn't exist in
+           the freshly-spawned fleet, and even if a same-named id existed by
+           chance, it wouldn't be at the position the old driver was headed
+           to. Resuming the *same* trip object toward its destination would
+           mean silently teleporting a driver to wherever the old one
+           happened to be — worse than admitting the ride was interrupted.
+        2. Submit a brand-new ride request for the same rider/destination
+           pair, so the rider is matched again (or told no drivers are
+           available) against the real, current fleet — "let a new match
+           happen," not "pretend nothing happened."
+
+        Returns a small stats dict so callers (main.py) can log/expose what
+        happened, which is also how the "kill mid-trip, restart, prove it
+        survived" verification is observed from the outside.
+        """
+        if self.store is None:
+            return {"active_trips_found": 0, "interrupted": 0, "resubmitted": 0}
+
+        active = self.store.list_active_trips()
+        resubmitted = 0
+        for row in active:
+            interrupted = Trip(
+                id=row["id"],
+                rider_lat=row["rider_lat"],
+                rider_lon=row["rider_lon"],
+                dest_lat=row["dest_lat"],
+                dest_lon=row["dest_lon"],
+                status=TripStatus.INTERRUPTED,
+                driver_id=row["driver_id"],
+                eta_min=None,
+                requested_at_tick=row["requested_at_tick"],
+                matched_at_tick=row["matched_at_tick"],
+                completed_at_tick=self.tick_count,
+            )
+            self.store.upsert_trip(interrupted)
+            self.request_ride(row["rider_lat"], row["rider_lon"], row["dest_lat"], row["dest_lon"])
+            resubmitted += 1
+
+        return {
+            "active_trips_found": len(active),
+            "interrupted": len(active),
+            "resubmitted": resubmitted,
+        }
 
     # ---- movement ----------------------------------------------------
 
@@ -263,6 +324,10 @@ class Simulation:
         return {
             "tick": self.tick_count,
             "matching_strategy": self.config.matching_strategy,
+            # What startup rehydration found/did (see _rehydrate_from_store) —
+            # zeros on a completely fresh database, non-zero right after a
+            # restart that followed an unclean shutdown mid-trip.
+            "rehydration": self.rehydration,
             "drivers": [
                 {
                     "id": d.id,

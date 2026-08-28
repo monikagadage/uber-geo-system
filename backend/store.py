@@ -108,5 +108,26 @@ class TripStore:
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
+    def list_active_trips(self) -> list[dict]:
+        """Trips still in flight as of the last write before this process
+        started: PENDING (batch strategy, never got matched), MATCHED (driver
+        assigned, hadn't picked up yet), or IN_PROGRESS (rider was in the
+        car). Used on startup by `Simulation._rehydrate_from_store()` to
+        recover from an unclean shutdown — see DESIGN.md "Fault-tolerant
+        restart".
+        """
+        cur = self._conn.execute(
+            """
+            SELECT id, rider_lat, rider_lon, dest_lat, dest_lon, driver_id,
+                   status, eta_min, requested_at_tick, matched_at_tick,
+                   completed_at_tick, requested_at, updated_at
+            FROM trips
+            WHERE status IN ('pending', 'matched', 'in_progress')
+            ORDER BY requested_at
+            """
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
     def close(self) -> None:
         self._conn.close()

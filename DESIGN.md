@@ -201,6 +201,60 @@ still remembers what trips happened. That split is deliberate for this
 demo's scope (see "what's deliberately left out" below) but is the first
 thing to fix if you wanted this to survive a real restart.
 
+## Fault-tolerant restart
+
+Before this, `Simulation.__init__` always started from a blank slate: 40
+fresh drivers at random positions, no trips. That's fine for a clean
+`Ctrl+C` shutdown (every trip is already `COMPLETED` or
+`NO_DRIVERS_AVAILABLE` by then), but if the process dies mid-trip — a
+crash, an out-of-memory kill, a deploy that SIGKILLs instead of draining —
+whatever trip was `PENDING`/`MATCHED`/`IN_PROGRESS` at that instant is
+frozen at that status in `data/trips.db` forever, and the next process has
+no idea it ever existed.
+
+`Simulation._rehydrate_from_store()` (`backend/simulation.py`) runs once,
+at the end of `__init__`, right after the fresh driver fleet is spawned:
+
+1. `TripStore.list_active_trips()` reads every trip still
+   `pending`/`matched`/`in_progress` in SQLite — by construction, only
+   trips an unclean shutdown left mid-flight, since a clean run always
+   drives every trip to a terminal status first.
+2. Each one is marked `INTERRUPTED` (a new terminal `TripStatus`) and
+   upserted back into the store, so it stops being "active" forever.
+3. A **brand-new** ride request is submitted for the same rider/destination
+   pair, matched against the real, current fleet.
+
+**Why resubmit instead of resuming the same trip toward the same
+destination:** driver state (`Simulation.drivers`, the spatial index) was
+never persisted — only trip history is durable (see "SQLite persistence
+model" above) — so the new process always spawns a fresh fleet at random
+positions. The old trip's `driver_id` names a driver that, in general,
+doesn't exist in the new fleet at all; even in the coincidental case where
+some driver reused that same id, it wouldn't be at the position the old
+driver was actually at when the crash happened. Silently "resuming" the
+old trip would mean either inventing a driver location out of thin air or
+quietly reassigning an unrelated driver — both misrepresent what actually
+happened. Marking it `INTERRUPTED` and dispatching a fresh request is
+honest about the crash and gets the rider re-matched immediately (or a
+clean "no drivers available" if the fleet genuinely can't cover it) —
+"let a new match happen," the option this repo's task list called out as
+acceptable. Driver-state persistence (so the fleet itself survives a
+restart, not just trip records) is still on the "where to go next" list
+below; without it, resuming toward the same destination isn't a truthful
+option in the first place.
+
+`GET /api/state` (and every `/ws` broadcast) includes a `"rehydration"`
+field — `{"active_trips_found", "interrupted", "resubmitted"}` — set once
+at startup, so this is observable from outside the process, not just in
+server logs. Verification performed for this change: request a ride, poll
+until it reaches `in_progress`, `kill -9` the server, confirm the row is
+still `in_progress` in `data/trips.db`, restart, and confirm (a) the
+startup log line and `GET /api/state`'s `rehydration` field both report
+`{"active_trips_found": 1, "interrupted": 1, "resubmitted": 1}`, (b) the
+original trip row flips to `status='interrupted'` in SQLite, and (c) a new
+trip row appears for the same rider lat/lon, matched to a (different)
+driver in the new fleet.
+
 ## What's deliberately left out / production differences
 
 These are the pieces that matter at Uber's actual scale but would just be
@@ -219,8 +273,11 @@ plumbing here, not new concepts:
 - **Surge pricing / supply-demand balancing** — dispatch here always picks
   the nearest free driver (or minimizes total batch distance); nothing
   models fare, incentives, or demand shaping.
-- **Fault tolerance** — no retries, replication, or failover. One process,
-  one point of failure, on purpose, to keep the code readable.
+- **Fault tolerance** — a restart now rehydrates *trip* state from SQLite
+  (see "Fault-tolerant restart" above), but there's still no retries,
+  replication, or failover, and driver/fleet state is never persisted, so
+  every restart still spawns a brand-new fleet at random positions. One
+  process, one point of failure, on purpose, to keep the code readable.
 - **H3 vs. QuadTree** — production Uber indexes with H3 (hexagonal
   hierarchical tiling at multiple resolutions); this repo uses a
   region-quadtree (recursive rectangle splitting). Same big-O purpose
@@ -233,7 +290,9 @@ plumbing here, not new concepts:
   (`pip install h3`) and compare query patterns — hexagons avoid the
   quadtree's uneven cell-size problem near boundaries.
 - Persist driver state too (not just trips), so a restart doesn't scatter
-  the fleet to random new positions.
+  the fleet to random new positions — and so a resumed trip could actually
+  continue toward its destination instead of being marked `INTERRUPTED`
+  and rematched (see "Fault-tolerant restart" above).
 - Make the batch window adapt to demand (shorter when there are more
   pending riders than idle drivers) instead of a fixed
   `batch_window_ticks`.

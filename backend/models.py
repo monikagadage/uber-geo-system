@@ -14,6 +14,13 @@ class TripStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     NO_DRIVERS_AVAILABLE = "no_drivers_available"
+    # Terminal status assigned on startup rehydration to any trip that was
+    # PENDING/MATCHED/IN_PROGRESS when the process died — see
+    # Simulation._rehydrate_from_store() and DESIGN.md "Fault-tolerant
+    # restart". The driver it names (if any) may not even exist in the new
+    # process's freshly-spawned fleet, so this trip itself never resumes;
+    # a brand-new trip is submitted for the same rider/destination instead.
+    INTERRUPTED = "interrupted"
 
 
 @dataclass

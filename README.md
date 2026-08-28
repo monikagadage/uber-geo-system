@@ -22,7 +22,13 @@ a dropoff pin, then hit **Request Ride**. You'll see a driver turn orange
 the destination — 40 simulated drivers are wandering the map the whole time.
 
 Trip history persists across restarts in a local SQLite file
-(`data/trips.db`, created on first run) — see `GET /api/trips`.
+(`data/trips.db`, created on first run) — see `GET /api/trips`. On startup
+the server also rehydrates any trip left `pending`/`matched`/`in_progress`
+by an unclean shutdown (a crash, `kill -9`, ...): it's marked
+`interrupted` and a fresh ride request is submitted for the same
+rider/destination against the real, current fleet. See `GET /api/state`'s
+`"rehydration"` field, and [DESIGN.md](DESIGN.md#fault-tolerant-restart)
+for why resubmitting beats trying to resume the same trip.
 
 By default, ride requests are matched greedily (nearest free driver, the
 instant the request arrives). To try the batch-assignment strategy instead:
@@ -41,7 +47,8 @@ window (every 3 ticks) resolves a whole group of pending requests at once.
 - Two matching strategies: greedy expanding-ring search, and batch
   assignment via the Hungarian algorithm (`scipy.optimize.linear_sum_assignment`)
 - SQLite-backed trip persistence (`backend/store.py`) — trip history
-  survives a restart
+  survives a restart, and any trip caught mid-flight by an unclean
+  shutdown is rehydrated and rematched on the next startup
 - FastAPI + WebSocket backend broadcasting live driver/trip state
 - Leaflet map frontend, no build step
 

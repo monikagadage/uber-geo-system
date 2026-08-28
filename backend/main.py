@@ -59,6 +59,15 @@ sim = Simulation(
 )
 manager = ConnectionManager()
 
+if sim.rehydration["active_trips_found"]:
+    print(
+        f"[startup] rehydrated from {store.db_path}: "
+        f"{sim.rehydration['active_trips_found']} trip(s) were still active at last shutdown -> "
+        f"marked INTERRUPTED and resubmitted {sim.rehydration['resubmitted']} fresh ride request(s)."
+    )
+else:
+    print(f"[startup] rehydrated from {store.db_path}: no active trips found (clean start).")
+
 
 async def simulation_loop() -> None:
     while True:
