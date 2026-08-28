@@ -255,6 +255,76 @@ original trip row flips to `status='interrupted'` in SQLite, and (c) a new
 trip row appears for the same rider lat/lon, matched to a (different)
 driver in the new fleet.
 
+## Surge pricing
+
+`backend/pricing.py` adds a per-grid-cell supply/demand fare multiplier.
+This is explicitly a toy model built to demonstrate the mechanism, not a
+production pricing engine — here is *exactly* what signal drives it, no
+more:
+
+- The city bounding box is sliced into a fixed `GRID_SIZE x GRID_SIZE`
+  grid (5x5 by default) — coarser than the QuadTree/H3 spatial index,
+  because pricing wants to reason about "this neighborhood," not
+  individual-driver precision.
+- **Demand** for a cell = count of ride requests that originated in that
+  cell within the last `SURGE_WINDOW_TICKS` ticks (30, i.e. the last 30
+  simulated seconds by default) — a plain rolling window kept in
+  `Simulation._recent_request_cells`, no decay curve, no smoothing.
+- **Supply** for a cell = count of currently `AVAILABLE` drivers physically
+  inside that same cell *right now* — a live count over `Simulation.drivers`,
+  not a moving average.
+- `pricing.surge_multiplier(demand, supply)`: 1.0x whenever supply covers
+  demand; above that it climbs *linearly* with the shortage fraction —
+  `1.0 + max(0, demand - supply) / supply` — capped at
+  `MAX_SURGE_MULTIPLIER` (3.0x). A cell with any demand and zero available
+  drivers is treated as fully surged (the cap), since there's no
+  denominator to compute a ratio from, not because zero supply is special
+  in any other sense.
+- `pricing.base_fare_usd(distance_km)`: `$4.00 + $1.75/km`, flat — no
+  time-based fare component, no per-minute rate, no minimums.
+- `Simulation.fare_estimate()` = `base_fare_usd(distance) *
+  surge_multiplier_at(pickup_cell)`. Called both by the read-only `GET
+  /api/fare-estimate` (no side effects — safe to call while a rider drags
+  pins around) and internally by `request_ride()`, which additionally
+  records the request into the demand window *before* quoting it, so a
+  request contributes to the same surge it's quoted (same as a real rider
+  requesting into an already-busy cell would see).
+
+**What this deliberately does not model:** time-of-day baselines, demand
+elasticity (raising price to actually suppress demand — this demo's fake
+riders don't respond to price at all), driver-incentive effects (surge
+pulling supply toward the cell), historical smoothing across ticks beyond
+the flat window, or any interaction between neighboring cells. It is one
+honest, inspectable ratio, not a market simulation.
+
+**A real effect visible in this demo, not a bug:** with the default 40
+drivers spread across a 25-cell grid (average 1.6 drivers/cell), it's
+common for a given cell to have zero available drivers in it at any one
+instant even when the fleet overall isn't busy — so a single ride request
+into a sparsely-covered cell hits the 3.0x cap immediately, not gradually.
+Observed directly while testing this feature: requesting a ride against
+the live 40-driver demo fleet quoted 1.0x before the request and 3.0x
+immediately after, because the pickup cell happened to have 0 available
+drivers in it right when the request landed. That's the model working as
+specified, not a calibration bug — it's also a fair reflection of how
+noisy a demand/supply ratio gets when the grid is fine relative to the
+fleet size; a real system would need either a coarser grid, a much larger
+fleet, or supply/demand smoothing to avoid exactly this jumpiness. The
+grid resolution here is deliberately left coarse enough to demonstrate the
+mechanism cleanly rather than tuned to be smooth at 40 drivers.
+
+Exposed via `GET /api/fare-estimate` (query params: `rider_lat`,
+`rider_lon`, `dest_lat`, `dest_lon`), plus every trip's locked-in
+`fare_usd`/`surge_multiplier` in `POST /api/request-ride`'s response,
+`GET /api/state`'s `trips[]`, and `GET /api/trips`. `GET /api/state` (and
+every `/ws` broadcast) also includes a `surge_grid` field — one entry per
+grid cell with its bounding box, current demand/supply counts, and
+multiplier — which the frontend renders as translucent red rectangles
+over the map (toggle: "Show surge heatmap" in the side panel), and the
+fare estimate line re-queries `GET /api/fare-estimate` on every WebSocket
+tick so it stays live while a rider has pickup/dropoff pins set but hasn't
+requested yet.
+
 ## What's deliberately left out / production differences
 
 These are the pieces that matter at Uber's actual scale but would just be
@@ -271,8 +341,10 @@ plumbing here, not new concepts:
   Production uses actual routing (road graph, live traffic) — a whole
   separate "routing service."
 - **Surge pricing / supply-demand balancing** — dispatch here always picks
-  the nearest free driver (or minimizes total batch distance); nothing
-  models fare, incentives, or demand shaping.
+  the nearest free driver (or minimizes total batch distance); a fare
+  multiplier now exists (see "Surge pricing" above) but it's a simple,
+  documented ratio with no elasticity or incentive modeling — it changes
+  the number shown, not who gets matched or how drivers behave.
 - **Fault tolerance** — a restart now rehydrates *trip* state from SQLite
   (see "Fault-tolerant restart" above), but there's still no retries,
   replication, or failover, and driver/fleet state is never persisted, so
@@ -296,3 +368,6 @@ plumbing here, not new concepts:
 - Make the batch window adapt to demand (shorter when there are more
   pending riders than idle drivers) instead of a fixed
   `batch_window_ticks`.
+- Smooth the surge grid (larger cells, a longer/decayed demand window, or
+  a bigger simulated fleet) so a single request in a sparsely-covered cell
+  doesn't jump straight to the multiplier cap — see "Surge pricing" above.

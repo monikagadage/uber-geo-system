@@ -40,6 +40,14 @@ MATCHING_STRATEGY=batch .venv/bin/uvicorn backend.main:app --reload --port 8420
 With batch matching, a ride request goes "pending" until the next batch
 window (every 3 ticks) resolves a whole group of pending requests at once.
 
+Once both pickup and dropoff are set, the panel shows a live fare
+estimate — `$base + surge` — and the map overlays a translucent red
+"surge heatmap" grid (toggle it off in the panel). Surge is a simple,
+honest ratio: recent ride requests vs. currently-available drivers in the
+same grid cell, capped at 3x — see
+[DESIGN.md](DESIGN.md#surge-pricing) for exactly what drives it and its
+known limitations (it's a demo heuristic, not a pricing model).
+
 ## Features
 
 - QuadTree spatial index with O(log n) radius queries, updated incrementally
@@ -49,6 +57,9 @@ window (every 3 ticks) resolves a whole group of pending requests at once.
 - SQLite-backed trip persistence (`backend/store.py`) — trip history
   survives a restart, and any trip caught mid-flight by an unclean
   shutdown is rehydrated and rematched on the next startup
+- Surge pricing (`backend/pricing.py`) — a per-grid-cell fare multiplier
+  driven by recent-requests-vs-available-drivers, exposed via
+  `GET /api/fare-estimate` and shown live in the frontend
 - FastAPI + WebSocket backend broadcasting live driver/trip state
 - Leaflet map frontend, no build step
 

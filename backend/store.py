@@ -39,6 +39,16 @@ CREATE TABLE IF NOT EXISTS trips (
 );
 """
 
+# Columns added after the table above first shipped. sqlite's `CREATE TABLE
+# IF NOT EXISTS` won't add columns to a `trips` table that already exists
+# on disk from an older version of this repo, so __init__ adds any of these
+# that are missing via ALTER TABLE -- a minimal hand-rolled migration,
+# adequate for one append-only table with no ORM in the loop.
+ADDED_COLUMNS = {
+    "fare_usd": "REAL",
+    "surge_multiplier": "REAL",
+}
+
 
 class TripStore:
     """Thin wrapper around one SQLite connection, one row per trip.
@@ -55,7 +65,14 @@ class TripStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.execute(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(trips)").fetchall()}
+        for column, sql_type in ADDED_COLUMNS.items():
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE trips ADD COLUMN {column} {sql_type}")
 
     def upsert_trip(self, trip: Trip) -> None:
         now = time.time()
@@ -64,16 +81,19 @@ class TripStore:
             INSERT INTO trips (
                 id, rider_lat, rider_lon, dest_lat, dest_lon, driver_id,
                 status, eta_min, requested_at_tick, matched_at_tick,
-                completed_at_tick, requested_at, updated_at
+                completed_at_tick, requested_at, updated_at,
+                fare_usd, surge_multiplier
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 driver_id = excluded.driver_id,
                 status = excluded.status,
                 eta_min = excluded.eta_min,
                 matched_at_tick = excluded.matched_at_tick,
                 completed_at_tick = excluded.completed_at_tick,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                fare_usd = excluded.fare_usd,
+                surge_multiplier = excluded.surge_multiplier
             """,
             (
                 trip.id,
@@ -89,6 +109,8 @@ class TripStore:
                 trip.completed_at_tick,
                 now,
                 now,
+                trip.fare_usd,
+                trip.surge_multiplier,
             ),
         )
         self._conn.commit()
@@ -98,7 +120,8 @@ class TripStore:
             """
             SELECT id, rider_lat, rider_lon, dest_lat, dest_lon, driver_id,
                    status, eta_min, requested_at_tick, matched_at_tick,
-                   completed_at_tick, requested_at, updated_at
+                   completed_at_tick, requested_at, updated_at,
+                   fare_usd, surge_multiplier
             FROM trips
             ORDER BY requested_at DESC
             LIMIT ?
@@ -120,7 +143,8 @@ class TripStore:
             """
             SELECT id, rider_lat, rider_lon, dest_lat, dest_lon, driver_id,
                    status, eta_min, requested_at_tick, matched_at_tick,
-                   completed_at_tick, requested_at, updated_at
+                   completed_at_tick, requested_at, updated_at,
+                   fare_usd, surge_multiplier
             FROM trips
             WHERE status IN ('pending', 'matched', 'in_progress')
             ORDER BY requested_at

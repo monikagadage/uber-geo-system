@@ -101,7 +101,20 @@ def request_ride(req: RideRequest) -> dict:
         "status": trip.status.value,
         "driver_id": trip.driver_id,
         "eta_min": trip.eta_min,
+        "fare_usd": trip.fare_usd,
+        "surge_multiplier": trip.surge_multiplier,
     }
+
+
+@app.get("/api/fare-estimate")
+def fare_estimate(rider_lat: float, rider_lon: float, dest_lat: float, dest_lon: float) -> dict:
+    """Upfront fare quote for a not-yet-requested trip, including the
+    current surge multiplier at the pickup location -- see
+    backend/pricing.py and DESIGN.md "Surge pricing" for exactly what
+    signal drives the multiplier. Read-only: doesn't record demand or
+    change any state, unlike POST /api/request-ride.
+    """
+    return sim.fare_estimate(rider_lat, rider_lon, dest_lat, dest_lon)
 
 
 @app.get("/api/state")

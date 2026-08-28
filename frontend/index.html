@@ -32,6 +32,7 @@
   <p class="hint">Click the map to set <b>pickup</b>, click again for <b>dropoff</b>, then request a ride.</p>
   <p id="pickup-line">Pickup: <i>not set</i></p>
   <p id="dropoff-line">Dropoff: <i>not set</i></p>
+  <p id="fare-line" class="hint"></p>
   <button id="request-btn" disabled>Request Ride</button>
   <button id="reset-btn">Reset Selection</button>
   <p id="trip-status"></p>
@@ -40,6 +41,11 @@
     <p class="status-line"><span style="background:#f39c12"></span> en route to pickup</p>
     <p class="status-line"><span style="background:#3498db"></span> on trip</p>
   </div>
+  <label class="status-line" style="margin-top:8px; cursor:pointer;">
+    <input type="checkbox" id="surge-toggle" checked style="margin:0 6px 0 0;" />
+    Show surge heatmap
+  </label>
+  <p class="hint" id="surge-hint">Darker red = higher demand vs. available drivers nearby. See DESIGN.md "Surge pricing" for the exact signal.</p>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -53,6 +59,8 @@ const STATUS_COLOR = {
 let map, driverMarkers = {}, pickup = null, dropoff = null;
 let pickupMarker = null, dropoffMarker = null, routeLine = null;
 let activeTripId = null;
+let surgeRects = {}; // "row,col" -> L.rectangle
+let showSurge = true;
 
 function initMap(bounds) {
   const center = [(bounds.min_lat + bounds.max_lat) / 2, (bounds.min_lon + bounds.max_lon) / 2];
@@ -76,6 +84,24 @@ function onMapClick(e) {
     dropoffMarker = L.marker(dropoff, { title: "Dropoff" }).addTo(map).bindPopup("Dropoff").openPopup();
     document.getElementById("dropoff-line").innerHTML = `Dropoff: ${dropoff.lat.toFixed(4)}, ${dropoff.lng.toFixed(4)}`;
     document.getElementById("request-btn").disabled = false;
+    fetchFareEstimate();
+  }
+}
+
+async function fetchFareEstimate() {
+  if (!pickup || !dropoff) return;
+  const params = new URLSearchParams({
+    rider_lat: pickup.lat, rider_lon: pickup.lng,
+    dest_lat: dropoff.lat, dest_lon: dropoff.lng,
+  });
+  try {
+    const res = await fetch(`/api/fare-estimate?${params}`);
+    const fare = await res.json();
+    const surgeNote = fare.surge_multiplier > 1 ? ` (surge ${fare.surge_multiplier}x)` : "";
+    document.getElementById("fare-line").innerHTML =
+      `Estimated fare: $${fare.estimated_fare_usd}${surgeNote}`;
+  } catch (err) {
+    document.getElementById("fare-line").innerHTML = "";
   }
 }
 
@@ -88,8 +114,16 @@ document.getElementById("reset-btn").onclick = () => {
   pickupMarker = dropoffMarker = routeLine = null;
   document.getElementById("pickup-line").innerHTML = "Pickup: <i>not set</i>";
   document.getElementById("dropoff-line").innerHTML = "Dropoff: <i>not set</i>";
+  document.getElementById("fare-line").innerHTML = "";
   document.getElementById("trip-status").innerHTML = "";
   document.getElementById("request-btn").disabled = true;
+};
+
+document.getElementById("surge-toggle").onchange = (e) => {
+  showSurge = e.target.checked;
+  for (const rect of Object.values(surgeRects)) {
+    if (showSurge) rect.addTo(map); else map.removeLayer(rect);
+  }
 };
 
 document.getElementById("request-btn").onclick = async () => {
@@ -105,15 +139,18 @@ document.getElementById("request-btn").onclick = async () => {
   });
   const data = await res.json();
   activeTripId = data.trip_id;
+  const fareNote = data.fare_usd != null
+    ? ` &mdash; $${data.fare_usd}${data.surge_multiplier > 1 ? ` (surge ${data.surge_multiplier}x)` : ""}`
+    : "";
   if (data.status === "no_drivers_available") {
     document.getElementById("trip-status").innerHTML = "No drivers available nearby — try again.";
     btn.disabled = false;
   } else if (data.status === "pending") {
     // Batch matching strategy: request is queued until the next batch window resolves it.
-    document.getElementById("trip-status").innerHTML = "Ride requested — waiting for next batch match&hellip;";
+    document.getElementById("trip-status").innerHTML = `Ride requested${fareNote} — waiting for next batch match&hellip;`;
   } else {
     document.getElementById("trip-status").innerHTML =
-      `Matched driver ${data.driver_id} &mdash; ETA ${data.eta_min} min`;
+      `Matched driver ${data.driver_id} &mdash; ETA ${data.eta_min} min${fareNote}`;
   }
 };
 
@@ -168,11 +205,36 @@ function renderActiveTrip(trips) {
   }
 }
 
+function surgeColor(multiplier) {
+  // 1.0x -> transparent, MAX (3.0x) -> deep red. Linear in between.
+  const t = Math.min(1, Math.max(0, (multiplier - 1) / 2));
+  return { color: "#c0392b", fillColor: "#e74c3c", fillOpacity: t * 0.45, opacity: t > 0 ? 0.5 : 0 };
+}
+
+function renderSurgeGrid(cells) {
+  if (!cells) return;
+  for (const cell of cells) {
+    const key = `${cell.row},${cell.col}`;
+    const bounds = [[cell.min_lat, cell.min_lon], [cell.max_lat, cell.max_lon]];
+    const style = surgeColor(cell.multiplier);
+    if (surgeRects[key]) {
+      surgeRects[key].setBounds(bounds);
+      surgeRects[key].setStyle(style);
+    } else {
+      surgeRects[key] = L.rectangle(bounds, { ...style, weight: 1, interactive: false })
+        .bindTooltip(`${cell.multiplier}x surge (demand ${cell.demand} / supply ${cell.supply})`);
+      if (showSurge) surgeRects[key].addTo(map);
+    }
+    surgeRects[key].setTooltipContent(`${cell.multiplier}x surge (demand ${cell.demand} / supply ${cell.supply})`);
+  }
+}
+
 async function bootstrap() {
   const res = await fetch("/api/state");
   const state = await res.json();
   initMap(state.bounds);
   renderDrivers(state.drivers);
+  renderSurgeGrid(state.surge_grid);
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -180,6 +242,8 @@ async function bootstrap() {
     const state = JSON.parse(evt.data);
     renderDrivers(state.drivers);
     renderActiveTrip(state.trips);
+    renderSurgeGrid(state.surge_grid);
+    if (pickup && dropoff) fetchFareEstimate(); // keep the quote reactive to live surge
   };
 }
 

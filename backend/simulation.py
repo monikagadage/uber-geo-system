@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from .geo import BoundingBox, QuadTree, bearing_deg, destination_point, haversine_km
 from .matching import eta_minutes, find_batch_assignment, find_nearest_available_driver
 from .models import Driver, DriverStatus, Trip, TripStatus
+from .pricing import GRID_SIZE, SURGE_WINDOW_TICKS, base_fare_usd, grid_cell, surge_multiplier
 from .store import TripStore
 
 # Downtown San Francisco, roughly 4.5km x 6km.
@@ -53,6 +54,10 @@ class Simulation:
         self.tick_count = 0
         self.pending_batch: list[str] = []  # trip ids awaiting the next batch window
         self._ticks_since_batch = 0
+        # Rolling window of recent ride-request grid cells, as (tick, row,
+        # col), used only for surge_multiplier_at()'s demand signal — see
+        # backend/pricing.py. Pruned every tick in tick().
+        self._recent_request_cells: list[tuple[int, int, int]] = []
         self._spawn_drivers()
         self._rebuild_index()
         self.rehydration: dict = self._rehydrate_from_store()
@@ -148,6 +153,82 @@ class Simulation:
             "resubmitted": resubmitted,
         }
 
+    # ---- surge pricing -------------------------------------------------
+
+    def _prune_recent_request_cells(self) -> None:
+        cutoff = self.tick_count - SURGE_WINDOW_TICKS
+        self._recent_request_cells = [c for c in self._recent_request_cells if c[0] >= cutoff]
+
+    def _record_request_cell(self, rider_lat: float, rider_lon: float) -> None:
+        row, col = grid_cell(rider_lat, rider_lon, CITY_BOUNDS)
+        self._recent_request_cells.append((self.tick_count, row, col))
+
+    def surge_multiplier_at(self, lat: float, lon: float) -> float:
+        """Current surge multiplier for whichever grid cell (lat, lon) falls
+        in. demand = ride requests in that cell within the last
+        SURGE_WINDOW_TICKS ticks; supply = AVAILABLE drivers physically in
+        that cell right now. See backend/pricing.py for the exact formula
+        and its (deliberate) limitations.
+        """
+        target = grid_cell(lat, lon, CITY_BOUNDS)
+        demand = sum(1 for _, row, col in self._recent_request_cells if (row, col) == target)
+        supply = sum(
+            1
+            for d in self.drivers.values()
+            if d.status == DriverStatus.AVAILABLE and grid_cell(d.lat, d.lon, CITY_BOUNDS) == target
+        )
+        return surge_multiplier(demand, supply)
+
+    def fare_estimate(self, rider_lat: float, rider_lon: float, dest_lat: float, dest_lon: float) -> dict:
+        """Upfront fare quote: base_fare(distance) * surge_multiplier(pickup
+        cell). Doesn't touch or record any state — safe to call as many
+        times as a rider drags the pickup/dropoff pins around before
+        actually requesting (see GET /api/fare-estimate).
+        """
+        distance_km = haversine_km(rider_lat, rider_lon, dest_lat, dest_lon)
+        fare = base_fare_usd(distance_km)
+        surge = self.surge_multiplier_at(rider_lat, rider_lon)
+        return {
+            "distance_km": round(distance_km, 3),
+            "base_fare_usd": fare,
+            "surge_multiplier": surge,
+            "estimated_fare_usd": round(fare * surge, 2),
+        }
+
+    def surge_grid(self) -> list[dict]:
+        """Multiplier for every cell of the GRID_SIZE x GRID_SIZE surge
+        grid, with its bounding box, so the frontend can paint a live surge
+        heatmap instead of only quoting a fare after the fact. O(grid_size^2
+        * num_drivers + grid_size^2 * recent_requests) -- fine at this
+        demo's scale (a 5x5 grid, tens-hundreds of drivers), broadcast once
+        per tick alongside everything else in snapshot().
+        """
+        lat_span = CITY_BOUNDS.max_lat - CITY_BOUNDS.min_lat
+        lon_span = CITY_BOUNDS.max_lon - CITY_BOUNDS.min_lon
+        cells = []
+        for row in range(GRID_SIZE):
+            for col in range(GRID_SIZE):
+                demand = sum(1 for _, r, c in self._recent_request_cells if (r, c) == (row, col))
+                supply = sum(
+                    1
+                    for d in self.drivers.values()
+                    if d.status == DriverStatus.AVAILABLE and grid_cell(d.lat, d.lon, CITY_BOUNDS) == (row, col)
+                )
+                cells.append(
+                    {
+                        "row": row,
+                        "col": col,
+                        "min_lat": CITY_BOUNDS.min_lat + lat_span * row / GRID_SIZE,
+                        "max_lat": CITY_BOUNDS.min_lat + lat_span * (row + 1) / GRID_SIZE,
+                        "min_lon": CITY_BOUNDS.min_lon + lon_span * col / GRID_SIZE,
+                        "max_lon": CITY_BOUNDS.min_lon + lon_span * (col + 1) / GRID_SIZE,
+                        "demand": demand,
+                        "supply": supply,
+                        "multiplier": surge_multiplier(demand, supply),
+                    }
+                )
+        return cells
+
     # ---- movement ----------------------------------------------------
 
     def _step_driver(self, driver: Driver, dt_seconds: float) -> None:
@@ -219,6 +300,7 @@ class Simulation:
             self._step_driver(driver, self.config.tick_seconds)
         if not self.config.incremental_index:
             self._rebuild_index()
+        self._prune_recent_request_cells()
 
         if self.config.matching_strategy == "batch":
             self._ticks_since_batch += 1
@@ -252,6 +334,11 @@ class Simulation:
 
     def request_ride(self, rider_lat: float, rider_lon: float, dest_lat: float, dest_lon: float) -> Trip:
         trip_id = uuid.uuid4().hex[:8]
+        # Record demand for surge purposes before quoting the fare, so this
+        # request's own presence counts toward the surge it's quoted --
+        # same as it would for anyone requesting into that cell right after.
+        self._record_request_cell(rider_lat, rider_lon)
+        fare = self.fare_estimate(rider_lat, rider_lon, dest_lat, dest_lon)
         trip = Trip(
             id=trip_id,
             rider_lat=rider_lat,
@@ -260,6 +347,8 @@ class Simulation:
             dest_lon=dest_lon,
             status=TripStatus.PENDING,
             requested_at_tick=self.tick_count,
+            fare_usd=fare["estimated_fare_usd"],
+            surge_multiplier=fare["surge_multiplier"],
         )
         self.trips[trip_id] = trip
 
@@ -348,6 +437,8 @@ class Simulation:
                     "dest_lon": t.dest_lon,
                     "driver_id": t.driver_id,
                     "eta_min": t.eta_min,
+                    "fare_usd": t.fare_usd,
+                    "surge_multiplier": t.surge_multiplier,
                 }
                 for t in self.trips.values()
             ],
@@ -357,5 +448,8 @@ class Simulation:
                 "max_lat": CITY_BOUNDS.max_lat,
                 "max_lon": CITY_BOUNDS.max_lon,
             },
+            # Live surge multiplier per grid cell -- see "Surge pricing" in
+            # DESIGN.md for exactly what demand/supply signal drives this.
+            "surge_grid": self.surge_grid(),
         }
 

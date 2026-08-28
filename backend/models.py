@@ -47,3 +47,8 @@ class Trip:
     completed_at_tick: int | None = None
     requested_at_tick: int | None = None
     matched_at_tick: int | None = None
+    # Fare estimate computed at request time (backend/pricing.py). Fixed at
+    # request time, not recomputed as the trip progresses -- same as a real
+    # upfront-fare quote.
+    fare_usd: float | None = None
+    surge_multiplier: float | None = None
