@@ -13,9 +13,27 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 EARTH_RADIUS_KM = 6371.0
+
+
+class SpatialIndex(Protocol):
+    """The three operations `matching.py` and `simulation.py` need from a
+    spatial index. `QuadTree` (below) and `backend/h3_index.py`'s
+    `H3Index` both satisfy this structurally (no inheritance needed) --
+    see `SimulationConfig.index_backend` for how a running simulation picks
+    one or the other and `benchmarks/h3_vs_quadtree.py` for a head-to-head
+    comparison.
+    """
+
+    def insert(self, lat: float, lon: float, payload: Any) -> bool: ...
+
+    def remove(self, lat: float, lon: float, payload: Any) -> bool: ...
+
+    def query_radius(
+        self, lat: float, lon: float, radius_km: float, results: list[tuple[float, Any]] | None = None
+    ) -> list[tuple[float, Any]]: ...
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

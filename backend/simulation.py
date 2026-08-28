@@ -15,7 +15,8 @@ import random
 import uuid
 from dataclasses import dataclass
 
-from .geo import BoundingBox, QuadTree, bearing_deg, destination_point, haversine_km
+from .geo import BoundingBox, QuadTree, SpatialIndex, bearing_deg, destination_point, haversine_km
+from .h3_index import H3Index
 from .matching import eta_minutes, find_batch_assignment, find_nearest_available_driver
 from .models import Driver, DriverStatus, Trip, TripStatus
 from .pricing import GRID_SIZE, SURGE_WINDOW_TICKS, base_fare_usd, grid_cell, surge_multiplier
@@ -39,9 +40,15 @@ class SimulationConfig:
     batch_window_ticks: int = 3
     batch_max_wait_ticks: int = 12  # give up and report no-drivers after this long pending
     # Update only the moved driver's cell(s) each tick instead of rebuilding
-    # the whole QuadTree. Kept switchable so the two strategies can be
+    # the whole index. Kept switchable so the two strategies can be
     # benchmarked against each other (see benchmarks/).
     incremental_index: bool = True
+    # Which spatial index implementation backs `Simulation.index`:
+    # "quadtree" (backend/geo.py, default) or "h3" (backend/h3_index.py,
+    # real H3 hex-grid indexing via the `h3` package). Both satisfy
+    # geo.SpatialIndex, so nothing else in this class needs to know which
+    # one it's using. See benchmarks/h3_vs_quadtree.py for a head-to-head.
+    index_backend: str = "quadtree"
 
 
 class Simulation:
@@ -50,7 +57,7 @@ class Simulation:
         self.store = store
         self.drivers: dict[str, Driver] = {}
         self.trips: dict[str, Trip] = {}
-        self.index: QuadTree = self._empty_index()
+        self.index: SpatialIndex = self._empty_index()
         self.tick_count = 0
         self.pending_batch: list[str] = []  # trip ids awaiting the next batch window
         self._ticks_since_batch = 0
@@ -64,7 +71,9 @@ class Simulation:
 
     # ---- setup -----------------------------------------------------
 
-    def _empty_index(self) -> QuadTree:
+    def _empty_index(self) -> SpatialIndex:
+        if self.config.index_backend == "h3":
+            return H3Index()
         return QuadTree(CITY_BOUNDS)
 
     def _spawn_drivers(self) -> None:
@@ -413,6 +422,7 @@ class Simulation:
         return {
             "tick": self.tick_count,
             "matching_strategy": self.config.matching_strategy,
+            "index_backend": self.config.index_backend,
             # What startup rehydration found/did (see _rehydrate_from_store) —
             # zeros on a completely fresh database, non-zero right after a
             # restart that followed an unclean shutdown mid-trip.

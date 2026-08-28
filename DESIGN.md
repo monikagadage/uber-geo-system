@@ -325,6 +325,112 @@ fare estimate line re-queries `GET /api/fare-estimate` on every WebSocket
 tick so it stays live while a rider has pickup/dropoff pins set but hasn't
 requested yet.
 
+## H3 alternative index
+
+`backend/h3_index.py`'s `H3Index` is a second, real spatial-index backend
+(the `h3` PyPI package -- Uber's own open-sourced hex-grid library, not a
+reimplementation), selectable alongside the `QuadTree` via
+`SimulationConfig.index_backend` ("quadtree", the default, or "h3"; set
+via `INDEX_BACKEND=h3 uvicorn backend.main:app ...`). Both satisfy the
+same three-method `geo.SpatialIndex` shape (`insert`/`remove`/
+`query_radius`), so `matching.py` and `simulation.py` work against
+whichever one `Simulation` was configured with, unmodified.
+
+**How it works:** every driver ping writes to a dict keyed by the H3 cell
+its (lat, lon) falls into at a fixed resolution (`DEFAULT_RESOLUTION = 9`,
+~0.2km hex edge). A radius query converts the search radius into a ring
+size `k` via `h3.grid_disk(center_cell, k)`, visits only cells in that
+ring, and filters candidates to the true haversine distance -- the same
+"don't scan the whole fleet" idea as the QuadTree's
+boundary-intersects-circle descent, just tiled with hexagons instead of
+recursively-split rectangles. Correctness was checked directly against a
+brute-force O(n) scan and against the QuadTree, at radii 0.5/1/2/4/8km
+over 500 random points: **all three returned identical driver-id sets at
+every radius**, and `remove()` was confirmed to actually remove a point
+(no longer findable afterward) for both index types.
+
+### Benchmark: `benchmarks/h3_vs_quadtree.py`
+
+Same random driver layout (fixed seed) fed to both index types, then 300
+random rider locations run through the *actual*
+`matching.find_nearest_available_driver` expanding-ring search (1, 2, 4,
+8, 16km rings) that the live simulation calls -- not an isolated
+`query_radius` microbenchmark. Real output, `.venv/bin/python3
+benchmarks/h3_vs_quadtree.py`:
+
+```
+=== Index construction (insert every driver once) ===
+ drivers |  quadtree build (ms) |   h3 build (ms)
+-------------------------------------------------
+      40 |                0.034 |           0.258
+     500 |                0.727 |           0.321
+    2000 |                4.051 |           1.281
+   10000 |               25.971 |           6.530
+   50000 |              183.588 |          31.136
+
+=== Nearest-driver query time (matching.find_nearest_available_driver) ===
+ drivers |  quadtree (us/query) |   h3 (us/query) | h3 vs quadtree
+------------------------------------------------------------------
+      40 |                18.95 |           45.28 | h3 is 2.39x slower
+     500 |               111.85 |          137.01 | h3 is 1.22x slower
+    2000 |              291.49  |         422.73  | h3 is 1.45x slower
+   10000 |             1175.22  |        1929.84  | h3 is 1.64x slower
+   50000 |             6742.72  |       10488.83  | h3 is 1.56x slower
+```
+
+**Honest read of these numbers, not the one that flatters the new code:**
+`H3Index.insert()` is consistently 2-6x faster to *build* than the
+QuadTree (an O(1) dict write vs. O(log n) tree descent), but the QuadTree
+wins on *nearest-driver query time* at every fleet size tested, by
+roughly 1.2x-2.4x. That's the opposite of what "H3 is the production
+choice" might lead you to expect, and it's real, not a bug -- it comes
+directly from this repo's specific access pattern:
+
+- `find_nearest_available_driver`'s expanding-ring search often has to
+  widen past 1km before it finds an available driver in a city this size
+  with the demo's driver densities, and each widen re-queries from
+  scratch. `H3Index.query_radius()`'s cell count grows roughly with the
+  *square* of the ring radius (`grid_disk(k)` visits `3k(k+1)+1` cells),
+  so an 8km or 16km ring at resolution 9 means enumerating thousands of
+  mostly-empty hex cells one dict-lookup at a time. The QuadTree's
+  `boundary.intersects_circle()` check prunes whole subtrees in one
+  comparison instead, so it doesn't pay that cost the same way.
+- Resolution matters a lot and there's no single right answer: a quick
+  side experiment at 2000 drivers (not part of the committed benchmark,
+  numbers below) swept `H3Index`'s resolution from 6 (huge ~3.7km hexes)
+  to 10 (tiny ~0.08km hexes):
+
+  ```
+  quadtree            : 289 us/query
+  h3 resolution=6      : 1020 us/query  (cells so big most drivers share one -- barely better than brute force)
+  h3 resolution=7      : 980 us/query
+  h3 resolution=8      : 613 us/query
+  h3 resolution=9      : 417 us/query   <- DEFAULT_RESOLUTION, empirically best of those tried
+  h3 resolution=10     : 520 us/query   (cells so small there are too many to enumerate per ring)
+  ```
+
+  Resolution 9 is a genuine sweet spot for this city size and these ring
+  radii, not an arbitrary pick -- but it's still slower than the
+  QuadTree's adaptive tree depth, which doesn't need this kind of manual
+  tuning to begin with.
+
+**Why this doesn't mean "H3 is worse, don't use it":** production Uber's
+H3 usage plays to different strengths this benchmark doesn't exercise --
+a much larger geographic extent than one small demo city (H3's cells tile
+the *entire* Earth uniformly, so there's no bounding-box edge case to
+handle the way a QuadTree needs one), multi-resolution hierarchy (index
+coarsely for continent/region-scale queries, finely for "who's on my
+block"), and uniform cell shape/area everywhere (a QuadTree's rectangular
+cells get uneven and distorted near boundaries and at different
+subdivision depths, which H3's hexagons don't). None of those advantages
+show up in a single-city, single-resolution, small-bounding-box benchmark
+like this one -- so take "QuadTree wins here" as a real result *for this
+specific workload*, not a general verdict on H3 vs. quadtrees. That's
+also exactly why this is now a swappable `SimulationConfig` choice instead
+of a hardcoded pick: which one actually wins depends on the deployment's
+geography and query pattern, and the honest way to know is to benchmark
+it, the way this section just did.
+
 ## What's deliberately left out / production differences
 
 These are the pieces that matter at Uber's actual scale but would just be
@@ -350,17 +456,22 @@ plumbing here, not new concepts:
   replication, or failover, and driver/fleet state is never persisted, so
   every restart still spawns a brand-new fleet at random positions. One
   process, one point of failure, on purpose, to keep the code readable.
-- **H3 vs. QuadTree** — production Uber indexes with H3 (hexagonal
-  hierarchical tiling at multiple resolutions); this repo uses a
-  region-quadtree (recursive rectangle splitting). Same big-O purpose
-  (turn "who's near me" into a small, bounded lookup instead of an O(n)
-  scan), different tiling shape and far less code.
+- **H3 vs. QuadTree** — both are now implemented and selectable (see "H3
+  alternative index" above); the region-quadtree is still the default
+  because it benchmarked faster on this repo's specific query pattern, not
+  because H3 wasn't wired up. What's still missing relative to production:
+  multi-resolution H3 indexing (coarse cells for wide queries, fine cells
+  for tight ones, switched dynamically) and geography spanning more than
+  one small bounding box, where H3's actual advantages over a quadtree
+  show up.
 
 ## Where to go next
 
-- Swap the `QuadTree` for a real [H3](https://h3geo.org/) index
-  (`pip install h3`) and compare query patterns — hexagons avoid the
-  quadtree's uneven cell-size problem near boundaries.
+- Try multi-resolution H3 indexing (coarse cells to prune the search
+  space fast, fine cells for the final candidates) instead of
+  `H3Index`'s single fixed resolution — see "H3 alternative index" above
+  for why the current single-resolution version benchmarks slower than
+  the QuadTree on this repo's expanding-ring query pattern.
 - Persist driver state too (not just trips), so a restart doesn't scatter
   the fleet to random new positions — and so a resumed trip could actually
   continue toward its destination instead of being marked `INTERRUPTED`

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from scipy.optimize import linear_sum_assignment
 
-from .geo import QuadTree, haversine_km
+from .geo import SpatialIndex, haversine_km
 from .models import Driver, DriverStatus
 
 SEARCH_RINGS_KM = [1, 2, 4, 8, 16]
@@ -31,7 +31,7 @@ AVG_URBAN_SPEED_KMH = 25.0
 
 
 def find_nearest_available_driver(
-    index: QuadTree, rider_lat: float, rider_lon: float, drivers: dict[str, Driver]
+    index: SpatialIndex, rider_lat: float, rider_lon: float, drivers: dict[str, Driver]
 ) -> tuple[Driver, float] | None:
     """Expanding-ring search: try a 1km radius, then widen until a driver is
     found or we run out of rings. Returns (driver, distance_km) or None.

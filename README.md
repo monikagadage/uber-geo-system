@@ -40,6 +40,17 @@ MATCHING_STRATEGY=batch .venv/bin/uvicorn backend.main:app --reload --port 8420
 With batch matching, a ride request goes "pending" until the next batch
 window (every 3 ticks) resolves a whole group of pending requests at once.
 
+The spatial index itself is also swappable — QuadTree (default) or a real
+[H3](https://h3geo.org/) hex-grid index:
+
+```bash
+INDEX_BACKEND=h3 .venv/bin/uvicorn backend.main:app --reload --port 8420
+```
+
+See [DESIGN.md](DESIGN.md#h3-alternative-index) for how they compare —
+short version: QuadTree wins on this repo's actual query pattern, real
+benchmark numbers included, not a guess.
+
 Once both pickup and dropoff are set, the panel shows a live fare
 estimate — `$base + surge` — and the map overlays a translucent red
 "surge heatmap" grid (toggle it off in the panel). Surge is a simple,
@@ -50,8 +61,9 @@ known limitations (it's a demo heuristic, not a pricing model).
 
 ## Features
 
-- QuadTree spatial index with O(log n) radius queries, updated incrementally
-  per driver ping instead of rebuilt from scratch each tick
+- Two spatial index backends, selectable at startup: a QuadTree with
+  O(log n) radius queries updated incrementally per driver ping, and a
+  real H3 hex-grid index (`backend/h3_index.py`, the `h3` package)
 - Two matching strategies: greedy expanding-ring search, and batch
   assignment via the Hungarian algorithm (`scipy.optimize.linear_sum_assignment`)
 - SQLite-backed trip persistence (`backend/store.py`) — trip history
@@ -65,15 +77,16 @@ known limitations (it's a demo heuristic, not a pricing model).
 
 ## Tech stack
 
-Python 3.10+, FastAPI, uvicorn, Pydantic, scipy (Hungarian algorithm),
-stdlib `sqlite3`. Frontend: one static HTML file with Leaflet, served by
-FastAPI's `StaticFiles`.
+Python 3.10+, FastAPI, uvicorn, Pydantic, scipy (Hungarian algorithm), h3
+(hex-grid spatial index), stdlib `sqlite3`. Frontend: one static HTML file
+with Leaflet, served by FastAPI's `StaticFiles`.
 
 ## Benchmarks
 
 ```bash
 .venv/bin/python3 benchmarks/index_rebuild_vs_incremental.py
 .venv/bin/python3 benchmarks/batch_vs_greedy.py
+.venv/bin/python3 benchmarks/h3_vs_quadtree.py
 ```
 
 See [DESIGN.md](DESIGN.md#benchmarks) for what each script measures and the

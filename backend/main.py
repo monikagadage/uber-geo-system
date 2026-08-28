@@ -28,6 +28,10 @@ TICK_SECONDS = 1.0
 # Set via e.g. `MATCHING_STRATEGY=batch uvicorn backend.main:app ...`.
 MATCHING_STRATEGY = os.environ.get("MATCHING_STRATEGY", "greedy")
 
+# "quadtree" (default) or "h3" — see SimulationConfig / backend/h3_index.py.
+# Set via e.g. `INDEX_BACKEND=h3 uvicorn backend.main:app ...`.
+INDEX_BACKEND = os.environ.get("INDEX_BACKEND", "quadtree")
+
 
 class ConnectionManager:
     def __init__(self) -> None:
@@ -54,7 +58,12 @@ class ConnectionManager:
 
 store = TripStore()
 sim = Simulation(
-    SimulationConfig(num_drivers=40, tick_seconds=TICK_SECONDS, matching_strategy=MATCHING_STRATEGY),
+    SimulationConfig(
+        num_drivers=40,
+        tick_seconds=TICK_SECONDS,
+        matching_strategy=MATCHING_STRATEGY,
+        index_backend=INDEX_BACKEND,
+    ),
     store=store,
 )
 manager = ConnectionManager()
